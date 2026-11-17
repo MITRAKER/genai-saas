@@ -1,0 +1,80 @@
+# Git hooks: the fast checks run on the files you change, before every commit,
+# so problems are caught on your machine in seconds instead of in CI minutes later.
+#
+#   pip install -r requirements-tools.txt
+#   pre-commit install              # once per clone: runs the hooks on `git commit`
+#   pre-commit run --all-files      # run every hook on every file
+#
+# CI runs exactly these hooks too (.github/workflows/ci.yml), so a commit that
+# passes here passes the CI lint job. `pre-commit autoupdate` bumps the revs.
+# mypy and the tests need each service's dependencies, so they run through
+# `make check` and CI instead of here.
+
+repos:
+  # General file hygiene.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+      - id: detect-private-key
+
+  # Python: lint (with safe autofixes) and formatting. Rules live in pyproject.toml.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.5
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  # NASA/JPL "Power of Ten" rules that ruff and mypy don't cover (tools/jpl_check.py).
+  - repo: local
+    hooks:
+      - id: jpl-check
+        name: NASA/JPL Power of Ten rules
+        entry: python tools/jpl_check.py
+        language: python
+        types: [python]
+
+  # Shell scripts.
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+
+  # Dockerfiles.
+  - repo: https://github.com/AleksaC/hadolint-py
+    rev: v2.15.1
+    hooks:
+      - id: hadolint
+
+  # GitHub Actions workflows: syntax and expressions (actionlint), and
+  # security problems such as script injection or loose permissions (zizmor).
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.32.0
+    hooks:
+      - id: zizmor
+        # Offline: the same result on every machine, with or without a GitHub token.
+        args: [--no-progress, --offline]
+
+  # Secrets: stop API keys and passwords before they reach git history.
+  # (CI also scans the full history with gitleaks in its own job.)
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks

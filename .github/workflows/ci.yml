@@ -1,41 +1,209 @@
+# Quality gates. Every pull request and every push to main must pass all of
+# these jobs before it can merge. The release workflow runs this file too,
+# so nothing is published that hasn't passed it. See LEARNING.md, lesson 3.
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Mondays 06:00 UTC: catches newly published vulnerabilities and broken
+    # upstream releases even in weeks without commits.
+    - cron: "0 6 * * 1"
+  workflow_call:
+  workflow_dispatch:
+
+# Jobs get no permissions unless they ask for them (least privilege).
+permissions: {}
+
+# A new push to a pull request cancels its older, now pointless run.
+# Runs on main always finish, so every commit there gets a result.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash # bash -eo pipefail: a failing command fails the step
+
+env:
+  PYTHON_VERSION: "3.12"
+  FORCE_COLOR: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  test:
+  lint:
+    name: Lint and hygiene (pre-commit)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-tools.txt
+      - run: pip install -r requirements-tools.txt
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Run every hook on every file
+        # gitleaks gets its own job below, which scans the whole history.
+        run: pre-commit run --all-files --show-diff-on-failure
+        env:
+          SKIP: gitleaks
+
+  tools:
+    name: Tools and scripts (types, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-tools.txt
+      - run: pip install -r requirements-tools.txt
+      - name: Type check (mypy --strict)
+        run: mypy tools/jpl_check.py scripts/review.py
+      - name: Tests with the coverage gate
+        run: pytest tools/tests scripts/tests --cov=tools --cov=scripts
+
+  service:
+    name: ${{ matrix.service }} service (types, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     strategy:
+      fail-fast: false # one failing service shouldn't hide the others' results
       matrix:
         service: [core, gateway, agent]
     defaults:
       run:
         working-directory: services/${{ matrix.service }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.12"
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: services/${{ matrix.service }}/requirements*.txt
+      # Only this service's own requirements: proves they are complete.
       - run: pip install -r requirements-dev.txt
-      - name: Lint
-        run: ruff check .
-      - name: Unit tests
-        run: pytest -q
+      - name: Type check (mypy --strict)
+        run: mypy app
+      - name: Tests with the coverage gate
+        run: pytest --cov=app --cov-config=../../pyproject.toml
+      - name: Coverage table in the run summary
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: |
+          {
+            echo "### $SERVICE coverage"
+            coverage report --rcfile=../../pyproject.toml --format=markdown
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  audit:
+    name: Dependency vulnerabilities (pip-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-tools.txt
+      - run: pip install -r requirements-tools.txt
+      - name: Check every pinned dependency against known vulnerabilities
+        run: make audit
+
+  secrets:
+    name: Secret scan (gitleaks, full history)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # every commit, not just the latest one
+          persist-credentials: false
+      - name: Install gitleaks (pinned version, checksum verified)
+        # Keep the version in step with .pre-commit-config.yaml.
+        env:
+          VERSION: 8.30.1
+          SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+      - name: Scan every commit for secrets
+        run: '"$RUNNER_TEMP/gitleaks" git --redact --verbose .'
 
   integration:
-    # Boots the real stack (Postgres, Redis, all services) and tests it
-    # end to end through the gateway, exactly like a user would.
-    needs: test
+    name: Full stack end to end (Docker Compose)
+    needs: [lint, tools, service]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - run: cp .env.example .env && echo "JWT_SECRET=$(openssl rand -hex 32)" >> .env
-      - run: docker compose up -d --build --wait
-      - run: ./scripts/smoke_test.sh
-      - if: failure()
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Create .env with a fresh JWT secret
+        run: sed "s/^JWT_SECRET=.*/JWT_SECRET=$(openssl rand -hex 32)/" .env.example > .env
+      - name: Build the images and start the stack
+        run: docker compose up --detach --build --wait
+      - name: Smoke test through the gateway
+        run: ./scripts/smoke_test.sh
+      - name: Stream a review with the command-line client
+        run: |
+          printf -- '--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a = 1\n+a = 2\n' \
+            | python3 scripts/review.py --notes "CI check"
+      - name: Service logs
+        if: failure()
         run: docker compose logs
+      - name: Stop the stack
+        if: always()
+        run: docker compose down --volumes
+
+  # One check to require in branch protection, instead of listing every job.
+  all-checks:
+    name: All checks passed
+    if: always()
+    needs: [lint, tools, service, audit, secrets, integration]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Fail unless every job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: $RESULTS"
+          for result in $RESULTS; do
+            if [ "$result" != success ]; then
+              exit 1
+            fi
+          done

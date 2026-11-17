@@ -1,0 +1,5 @@
+# Store text with LF line endings, so scripts run in Linux containers even
+# when they were edited on Windows.
+* text=auto eol=lf
+*.png binary
+*.jpg binary

@@ -7,6 +7,7 @@ user, applies rate limits and forwards the request with X-User-Id.
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 import anthropic
 from fastapi import FastAPI, Header, HTTPException, Request, status
@@ -22,21 +23,20 @@ logger = logging.getLogger("agent")
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    client = None
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.llm_provider == "fake":
         app.state.provider = FakeProvider(delay=settings.fake_delay_seconds)
-    else:
-        # Reads ANTHROPIC_API_KEY from the environment; never hard-code keys.
-        # The SDK retries 429/5xx/connection errors with backoff (max_retries).
-        client = anthropic.AsyncAnthropic(max_retries=2)
+        logger.info("LLM provider: fake")
+        yield
+        return
+    # Reads ANTHROPIC_API_KEY from the environment; never hard-code keys.
+    # The SDK retries 429/5xx/connection errors with backoff (max_retries).
+    async with anthropic.AsyncAnthropic(max_retries=2) as client:
         app.state.provider = AnthropicProvider(
             client, settings.anthropic_model, settings.review_effort, settings.review_max_tokens
         )
-    logger.info("LLM provider: %s", settings.llm_provider)
-    yield
-    if client:
-        await client.close()
+        logger.info("LLM provider: anthropic, model %s", settings.anthropic_model)
+        yield
 
 
 app = FastAPI(title="AI Agent Service", lifespan=lifespan)
@@ -44,22 +44,25 @@ app = FastAPI(title="AI Agent Service", lifespan=lifespan)
 
 class ReviewRequest(BaseModel):
     diff: str = Field(min_length=1, description="A unified diff, e.g. the output of `git diff`")
-    notes: str | None = Field(default=None, max_length=2000,
-                              description="Optional notes from the author: what to focus on")
+    notes: str | None = Field(
+        default=None, max_length=2000, description="Optional notes from the author"
+    )
 
 
 @app.get("/health")
-def health():
+def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.post("/reviews/stream")
-async def stream_review(body: ReviewRequest, request: Request, x_user_id: str = Header(...)):
+async def stream_review(
+    body: ReviewRequest, request: Request, x_user_id: Annotated[str, Header()]
+) -> StreamingResponse:
     # Check limits *before* calling the model: an oversized diff would cost
     # money and probably exceed the context window anyway.
     if len(body.diff) > settings.max_diff_chars:
         raise HTTPException(
-            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status.HTTP_413_CONTENT_TOO_LARGE,
             f"Diff is too large ({len(body.diff)} characters, limit {settings.max_diff_chars})",
         )
     provider: ReviewProvider = request.app.state.provider
@@ -72,7 +75,7 @@ async def stream_review(body: ReviewRequest, request: Request, x_user_id: str = 
             yield format_sse(event.type, event.data)
 
     return StreamingResponse(
-        with_keepalive(events(), settings.keepalive_seconds),
+        with_keepalive(events(), settings.keepalive_seconds, settings.review_timeout_seconds),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

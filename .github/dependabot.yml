@@ -1,0 +1,56 @@
+# Dependabot opens pull requests that keep dependencies current, and CI checks
+# each one like any other change. Updates are grouped (one pull request per
+# ecosystem each week) and wait 7 days after a release (cooldown), so a broken
+# or malicious release is usually caught by others before it reaches us.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directories:
+      - /
+      - /services/core
+      - /services/gateway
+      - /services/agent
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      python:
+        patterns: ["*"]
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: docker
+    directories:
+      - /services/core
+      - /services/gateway
+      - /services/agent
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      docker:
+        patterns: ["*"]
+    ignore:
+      # Moving to a new Python (3.13, ...) is a decision for a person, with its
+      # own pull request. Dependabot keeps the 3.12 patch releases coming.
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
