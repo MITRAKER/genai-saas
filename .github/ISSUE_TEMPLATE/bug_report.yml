@@ -1,0 +1,50 @@
+name: Bug report
+description: Something doesn't work the way it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Thanks for the report! Please leave out secrets, API keys and personal data.
+        Security problems go in a private report instead (see SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. docker compose up --build --wait
+        2. git diff | python3 scripts/review.py
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part?
+      options:
+        - gateway
+        - core (accounts)
+        - agent (AI reviews)
+        - command-line scripts
+        - CI, tooling or docs
+        - not sure
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Output of `docker compose logs <service>`, if it helps.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.3.0, or a commit SHA

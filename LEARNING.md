@@ -80,7 +80,7 @@ search in milestone 3, so we don't need a separate vector database yet.
   (`config.py` + `.env`). The same image runs in dev, CI and production.
 - **Testing without real infrastructure** — core tests use in-memory SQLite;
   gateway tests swap Redis for `fakeredis` and the core API for an
-  `httpx.MockTransport`. Fast unit tests, then CI's integration job checks the
+  `httpx2.MockTransport`. Fast unit tests, then CI's integration job checks the
   real thing with Docker.
 - **Containers as non-root** — each `Dockerfile` creates `appuser`, so a bug
   in our code can't modify the container's system files.
@@ -226,4 +226,219 @@ billing and plan limits.
 
 ---
 
-*Next lesson: GitHub integration: reviewing real pull requests and posting comments.*
+## Lesson 3: Professional engineering: quality gates, CI/CD and the NASA/JPL rules
+
+### What we built
+
+```
+pyproject.toml            one set of rules for every service: ruff, mypy, pytest, coverage
+tools/jpl_check.py        checks the NASA/JPL rules that no existing tool covers
+.pre-commit-config.yaml   fast checks on every commit, on your machine
+Makefile                  `make check` runs what CI runs
+.github/workflows/
+  ci.yml                  the quality gates, on every pull request and push
+  codeql.yml              code scanning for security bugs
+  release.yml             tag vX.Y.Z: images on ghcr.io + a GitHub release
+.github/dependabot.yml    weekly dependency updates, as pull requests
+CHANGELOG.md  CONTRIBUTING.md  SECURITY.md  CODE_OF_CONDUCT.md  docs/adr/
+```
+
+This lesson added no features. It changed *how* every line gets written,
+checked and shipped. The path of one change now looks like this:
+
+```
+editor ──► git commit ──► pre-commit hooks          (seconds, on your machine)
+              │
+              ▼
+        pull request ──► CI: lint · types · JPL rules · tests + coverage
+              │              dependency audit · secret scan · full stack e2e
+              │          CodeQL code scanning
+              ▼
+        merge to main ──► tag v0.3.0 ──► Release: CI again ──► images ──► GitHub release
+```
+
+### Why it is designed this way
+
+**Why so many checks?** Each one catches a different kind of mistake, and
+each costs seconds or minutes. The same bug found by a user costs hours of
+debugging plus their trust. The idea is called *shift left*: move every check
+as far left on the path above as it can go.
+
+**Why check on my machine *and* in CI?** The pre-commit hooks give feedback in
+seconds and fix formatting for you. CI is the gate nobody can skip (hooks can
+be bypassed with `git commit --no-verify`; a required CI check can't). Both
+run the same tools, at the same versions, with the same configuration, so
+"passes on my machine" means "passes CI".
+
+**Why pin every version?** ruff 0.17.5, Python 3.12.16, every GitHub Action
+by its full commit SHA. An unpinned tool changes under you: a new release adds
+a rule and CI fails on code nobody touched. Pinned versions change only
+through a Dependabot pull request that CI tests first. Pinning Actions by SHA
+matters for security too: in March 2025 an attacker took over the popular
+`tj-actions/changed-files` action and moved its version tags to malicious
+code that printed CI secrets into public logs. Workflows pinned to a SHA kept
+running the old, safe code.
+
+**Why does CI install each service on its own?** In production each image
+installs only its own `requirements.txt`. In one shared dev environment, a
+gateway import of a package that only the agent lists would work by accident.
+CI's per-service install catches that.
+
+**Why `permissions: {}`?** Every workflow starts with no permissions, and each
+job asks only for what it needs (`contents: read` for most, `packages: write`
+only for publishing images). If a dependency or an action is ever
+compromised, it can't push code or publish anything.
+
+**Why release from tags?** A tag names one exact commit. The release workflow
+runs the whole CI again on it, then publishes images tagged `0.3.0`, `0.3`
+and `sha-abc1234`, so a deployment can pin an exact version and roll back to
+the previous one. A version without notes in `CHANGELOG.md` can't be
+released at all.
+
+### The NASA/JPL "Power of Ten", adapted to Python
+
+In 2006 Gerard Holzmann, at NASA's Jet Propulsion Laboratory, wrote ten rules
+for code that flies spacecraft. They are short enough to remember, and each
+one can be checked by a machine. Their spirit applies to any code: write code
+that tools can analyze and people can review, and make failures loud and
+early. The original rules are for C, so a few needed translating to Python:
+
+| # | Original rule (C) | Our Python version | Enforced by |
+|---|---|---|---|
+| 1 | Simple control flow: no `goto`, no recursion | No recursion; few branches per function | `jpl_check` JPL1; ruff C901 (complexity ≤ 8), PLR0912 (branches ≤ 8) |
+| 2 | Every loop has a fixed upper bound | No `while`; `for` over a bounded range; streams get a step limit *and* a deadline | `jpl_check` JPL2 |
+| 3 | No dynamic memory allocation after startup | Python allocates all the time, so we keep the intent: every input has a size limit, and pools are created once at startup | Pydantic bounds; gateway body limit; pools in `lifespan` |
+| 4 | A function fits on one page (60 lines) | Same | `jpl_check` JPL4; ruff PLR0915 (≤ 40 statements) |
+| 5 | At least two assertions per function | Check inputs at the boundary, raise on impossible states. Not with `assert`: `python -O` deletes it | Pydantic `Field` bounds; ruff S101 |
+| 6 | Declare data in the smallest scope | No `global`; constants are `Final`; shared tables are read-only | `jpl_check` JPL6; `MappingProxyType`, frozen dataclasses |
+| 7 | Check every return value and parameter | No dropped awaitables, no blind `except`, check what external systems return | mypy `unused-awaitable`; ruff BLE, TRY, B |
+| 8 | Limit the preprocessor | No code generated at run time | `jpl_check` JPL8 (`eval`, `exec`, `compile`, `__import__`, `import_module`) |
+| 9 | Restrict pointers; no function pointers | No attribute access by computed name | `jpl_check` JPL9 (`getattr`/`setattr`/`delattr` with a variable) |
+| 10 | All warnings on, zero warnings, daily static analysis | Strictest useful mode for every tool; any warning fails the build | mypy `--strict`, ruff, pytest `filterwarnings = error`, CodeQL, shellcheck, hadolint, actionlint, zizmor |
+
+Where to see each rule in the code:
+
+- **Rule 2**: `with_keepalive` in `services/agent/app/sse.py` used a
+  `while True` loop. It is now `for _ in range(MAX_STEPS)` *plus* a 600-second
+  deadline, so even a model that never stops talking can't hold a connection
+  (and our bill) open forever. `scripts/review.py` reads at most `MAX_LINES`.
+- **Rule 3**: the gateway used to read request bodies of any size into
+  memory, so one huge upload could exhaust it. `read_body` in
+  `services/gateway/app/main.py` now stops at 1 MiB, even when a client sends
+  the body in chunks without a `Content-Length` header.
+- **Rule 5**: every setting in each `config.py` has bounds, so
+  `RATE_LIMIT_FREE=-5` stops the service at startup with a clear message
+  instead of misbehaving at 3 AM. `count_request` in `ratelimit.py` raises if
+  Redis ever answers `INCR` with something that isn't a number.
+- **Rule 6**: `ROUTES` in `services/gateway/app/config.py` is read-only; the
+  test `test_routes_are_read_only` proves nothing can add a route at run time.
+- **Rule 7**: `finished_event` in `llm.py` checks *why* Claude stopped instead
+  of assuming success. `_ = pipe.incr(key)` says "I am ignoring this return
+  value on purpose", which a reviewer can see.
+
+**How `tools/jpl_check.py` works.** Python can parse its own source into an
+*abstract syntax tree* (AST): a tree of nodes like `While`, `Call` and
+`FunctionDef`. The checker walks every node and reports the patterns the
+rules forbid. The heart of rule 2 is just:
+
+```python
+if isinstance(node, ast.While):
+    return [Violation(path, node.lineno, "JPL2", "`while` loop has no fixed upper bound")]
+```
+
+That is how most linters work, ruff included. Writing a small one yourself
+is the best way to understand them.
+
+### Key concepts
+
+- **Linter, formatter, type checker.** A *formatter* (`ruff format`) decides
+  layout, so reviews never discuss spaces. A *linter* (`ruff check`) finds
+  suspicious patterns: unused variables, `except Exception`, SQL built with
+  string concatenation. A *type checker* (`mypy --strict`) proves that every
+  function gets and returns what its annotations say, without running it.
+- **Line and branch coverage.** Line coverage asks "did this line run?";
+  branch coverage asks "did *both* sides of this `if` run?". Every service,
+  script and tool is at 100% of both. That doesn't prove the code correct,
+  only that nothing is untested. The 90% gate stops coverage from quietly
+  decaying.
+- **Warnings are future errors.** After the upgrade, Starlette deprecated
+  `HTTP_413_REQUEST_ENTITY_TOO_LARGE` and started warning about the old
+  `httpx`. With warnings as errors, the tests failed that same minute and we
+  fixed both, instead of breaking at the next major release.
+- **Dependency audit.** `pip-audit` compares every pinned package with a
+  database of published vulnerabilities. Its first run here found
+  vulnerable versions of Starlette and PyJWT, so we upgraded everything.
+- **Secret scanning.** A key that reaches git history stays there even after
+  you delete the file, and a public repository is scraped by bots within
+  minutes. gitleaks checks every commit, and the pre-commit hook stops a key
+  before it is ever committed. If one leaks anyway: revoke it first, then
+  clean up.
+- **Fail closed.** The services used to fall back to a JWT secret written in
+  the source code. Anyone who read this public repository could have forged a
+  token for any deployment that forgot to set its own. Now they refuse to
+  start without a real secret: a loud failure on day one beats a silent hole.
+- **Supply chain security.** Our code is a small part of what runs: there are
+  hundreds of packages, base images and Actions under it. We pin them, let
+  Dependabot update them only after a 7-day cooldown (most malicious releases
+  are caught within days), verify the checksum of tools we download in CI,
+  and attach an SBOM (a list of everything inside) and build provenance (how
+  and from what it was built) to every image we publish.
+- **Code scanning.** CodeQL turns the code into a database and follows data
+  from untrusted sources (an HTTP request) to dangerous sinks (a SQL query, a
+  shell command, a file path, a log file). It also reads our workflow files,
+  where injection bugs are common. Its first run on this lesson's pull
+  request found a real one: the agent wrote the `X-User-Id` header into its
+  log unchecked, so whoever could reach the agent could write fake log lines.
+  The agent now parses the header into a number first (`main.py`), and logs
+  only that number.
+- **Semantic versioning and the changelog.** `MAJOR.MINOR.PATCH`: patch for
+  fixes, minor for features, major for breaking changes. `CHANGELOG.md` is
+  written for people, in the same pull request as the change, under
+  **Unreleased**.
+- **Architecture decision records.** `docs/adr/` holds one short note per big
+  decision: the situation, the choice, the cost. Code shows *what*; ADRs keep
+  *why*.
+
+**The rules found real bugs.** Applying them to the code from lessons 1 and 2
+found and fixed: unbounded request bodies in the gateway, a rate-limit
+counter that could lose its expiry and block a user forever, tokens without
+an expiry date being accepted, a server error for passwords over 72 bytes, a
+review stream without a time limit, a built-in default secret, and two
+vulnerable dependencies. None of them had shown up in normal testing.
+
+The final review of this lesson found one more, a classic: the gateway
+decided "public or protected?" from the path *before* the `..` in it was
+resolved. `/api/auth/../users/me` looked public to the gateway, then the HTTP
+client cleaned it up to `/users/me`, a protected route, and sent it with no
+token check and no rate limit. Core still refused it, because the user-id
+header was missing: a second layer of defense is what kept this from being a
+real hole. The gateway now refuses any path with `.` or `..` segments, and
+both a unit test and the smoke test check it (try
+`curl --path-as-is localhost:8000/api/auth/../users/me`).
+
+### Try it yourself
+
+1. Set up and run everything: `make install`, then `make check`. Read the
+   output of each tool.
+2. Break rule 2 on purpose: add `while True: pass` to any service, then run
+   `make jpl` and try to `git commit` it. Which tool stops you, and when?
+3. Add `os.system("git log " + branch)` to a service. Which tools complain,
+   and what attack are they warning you about? (Hint: what if `branch` is
+   `"main; rm -rf /"`?)
+4. Delete a test and run `make test`. Watch the coverage gate fail and read
+   which lines are now untested.
+5. Exercise: `jpl_check` only looks at `for` *statements*, so
+   `[x for x in itertools.count()]` slips through. Write a failing test in
+   `tools/tests/test_jpl_check.py` first, then extend `check_loop` to check
+   comprehensions (`ast.comprehension`) as well.
+6. Exercise: once the milestone pull requests are merged, release v0.3.0.
+   Move the **Unreleased** notes in `CHANGELOG.md` under `## [0.3.0]`, merge
+   that, tag it, and watch the Release workflow publish the images.
+7. Question to think about: in a weekend prototype, which of the ten rules
+   would you relax, and which would you keep no matter what? (Hint: which
+   mistakes are cheap to fix later, and which ones become outages or
+   breaches?)
+
+---
+
+*Next lesson (4): GitHub integration: reviewing real pull requests and posting comments.*

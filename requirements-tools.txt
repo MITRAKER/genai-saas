@@ -1,0 +1,13 @@
+# Repository-wide quality tools (each service has its own requirements*.txt).
+#   pip install -r requirements-tools.txt
+# Versions are pinned so every machine and CI run checks the code the same way;
+# Dependabot proposes upgrades.
+pre-commit==4.7.0
+pip-audit==2.10.1
+pytest==9.2.0
+pytest-cov==7.1.0
+mypy==2.4.1
+ruff==0.17.5
+# mypy loads the pydantic plugin configured in pyproject.toml, even for the
+# tools and scripts, so it needs pydantic importable.
+pydantic==2.14.3

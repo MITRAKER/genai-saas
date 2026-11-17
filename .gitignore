@@ -1,6 +1,27 @@
+# Secrets: copy .env.example to .env and never commit the real file.
 .env
+
+# Python
 __pycache__/
-*.pyc
-.pytest_cache/
+*.py[cod]
 .venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Tool caches and reports
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+
 node_modules/

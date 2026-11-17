@@ -1,0 +1,105 @@
+# Shared tool configuration for every service in this repository.
+# Each service keeps its own requirements*.txt and Dockerfile; the quality
+# rules below apply to all of them. See LEARNING.md, lesson 3.
+
+# ---------------------------------------------------------------- ruff ----
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes: unused names, undefined names
+    "I",        # import order
+    "N",        # naming conventions
+    "UP",       # modern Python syntax
+    "B",        # bugbear: likely bugs and design problems
+    "A",        # don't shadow builtins
+    "C90",      # cyclomatic complexity          (JPL rule 1: simple control flow)
+    "PL",       # pylint: branches, statements,   (JPL rules 1 and 4)
+                #   arguments, global statements  (JPL rule 6)
+    "S",        # bandit security checks         (JPL rules 8 and 10)
+    "BLE",      # no blind `except Exception`    (JPL rule 7: handle every error)
+    "TRY",      # exception-handling practices    (JPL rule 7)
+    "ASYNC",    # asyncio pitfalls
+    "DTZ",      # timezone-aware datetimes only
+    "SIM",      # simplifiable code
+    "RET",      # consistent returns
+    "PIE",      # unnecessary code
+    "ARG",      # unused arguments
+    "ERA",      # no commented-out code
+    "T20",      # no print() in services
+    "PT",       # pytest style
+    "PGH",      # no blanket `# type: ignore` / `# noqa`
+    "RUF",      # ruff's own rules
+]
+ignore = [
+    "TRY003",   # short messages inside HTTPException(...) are fine
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 8          # JPL rule 1: keep control flow simple
+
+[tool.ruff.lint.pylint]
+max-branches = 8            # JPL rule 1
+max-statements = 40         # JPL rule 4: functions fit on one screen
+max-args = 6
+max-returns = 4
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use assert, literal numbers, fake passwords and fixtures as arguments.
+"**/tests/**" = ["S101", "S105", "S106", "PLR2004", "ARG001", "ARG002"]
+# Command-line scripts and tools talk to the user through print().
+"scripts/**" = ["T201"]
+"tools/**" = ["T201"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "jpl_check", "review"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ---------------------------------------------------------------- mypy ----
+[tool.mypy]
+python_version = "3.12"
+strict = true                       # JPL rule 10: strongest static checking
+warn_unreachable = true
+enable_error_code = [
+    "unused-awaitable",             # JPL rule 7: don't drop a result by accident
+    "redundant-expr",
+    "truthy-bool",
+    "ignore-without-code",
+    "possibly-undefined",
+]
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+# --------------------------------------------------------------- pytest ---
+[tool.pytest.ini_options]
+addopts = ["--strict-markers", "--strict-config", "-ra"]
+# Lets the tests of tools/ and scripts/ import the module they test.
+pythonpath = ["tools", "scripts"]
+xfail_strict = true
+# JPL rule 10: zero warnings. Any warning fails the test run.
+filterwarnings = ["error"]
+
+# ------------------------------------------------------------- coverage ---
+[tool.coverage.run]
+branch = true
+source = ["app"]
+omit = ["*/tests/*"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "class .*\\(Protocol\\):",
+    "^\\s*\\.\\.\\.$",
+]

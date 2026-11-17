@@ -1,0 +1,5 @@
+# Send Docker only what the image needs; tests, caches and local files stay out.
+*
+!requirements.txt
+!app/
+**/__pycache__/
