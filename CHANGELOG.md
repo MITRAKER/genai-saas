@@ -59,6 +59,9 @@ those notes under a new version heading (see CONTRIBUTING.md, "Releasing").
   passed the public `/api/auth` route without a token or a rate limit and
   reached a protected route (core still refused it, for lack of a user id).
   The gateway now answers such paths with `400`.
+- The agent wrote the `X-User-Id` header into its logs without checking it
+  (log injection, found by CodeQL). It now accepts only a positive number
+  (`422` otherwise) and logs the parsed number.
 - Upgraded Starlette (through FastAPI) and PyJWT past published
   vulnerabilities that pip-audit found.
 - The services refuse to start without a `JWT_SECRET` of at least 32

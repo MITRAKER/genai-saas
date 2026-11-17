@@ -7,7 +7,7 @@ user, applies rate limits and forwards the request with X-User-Id.
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Final
 
 import anthropic
 from fastapi import FastAPI, Header, HTTPException, Request, status
@@ -20,6 +20,10 @@ from .sse import format_sse, with_keepalive
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("agent")
+
+# The gateway forwards the id from the user's verified token: always a positive
+# whole number. A request with anything else did not come through the gateway.
+USER_ID_PATTERN: Final = r"^[1-9][0-9]{0,18}$"
 
 
 @asynccontextmanager
@@ -56,8 +60,13 @@ def health() -> dict[str, str]:
 
 @app.post("/reviews/stream")
 async def stream_review(
-    body: ReviewRequest, request: Request, x_user_id: Annotated[str, Header()]
+    body: ReviewRequest,
+    request: Request,
+    x_user_id: Annotated[str, Header(pattern=USER_ID_PATTERN)],
 ) -> StreamingResponse:
+    # Parse the header once, at the boundary (JPL rule 5). Only this number is
+    # ever logged, so no request can write text of its choosing into our logs.
+    user_id = int(x_user_id)
     # Check limits *before* calling the model: an oversized diff would cost
     # money and probably exceed the context window anyway.
     if len(body.diff) > settings.max_diff_chars:
@@ -71,7 +80,7 @@ async def stream_review(
         async for event in provider.stream_review(body.diff, body.notes):
             if event.type == "done":
                 # Milestone 4 turns this log line into usage-based billing.
-                logger.info("review done user=%s usage=%s", x_user_id, event.data["usage"])
+                logger.info("review done user=%d usage=%s", user_id, event.data["usage"])
             yield format_sse(event.type, event.data)
 
     return StreamingResponse(

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 
 import anthropic
@@ -62,6 +63,19 @@ def test_stream_review_end_to_end(client):
 
 def test_requires_user_id_from_gateway(client):
     assert client.post("/reviews/stream", json={"diff": DIFF}).status_code == 422
+
+
+@pytest.mark.parametrize("user_id", ["abc", "0", "-1", "1 2", "7\tx", "1" * 20])
+def test_user_id_must_be_a_positive_number(client, user_id):
+    r = client.post("/reviews/stream", json={"diff": DIFF}, headers={"X-User-Id": user_id})
+    assert r.status_code == 422
+
+
+def test_usage_is_logged_with_the_user_id(client, caplog):
+    with caplog.at_level(logging.INFO, logger="agent"):
+        r = client.post("/reviews/stream", json={"diff": DIFF}, headers={"X-User-Id": "42"})
+    assert r.status_code == 200
+    assert "review done user=42 usage=" in caplog.text
 
 
 def test_oversized_diff_rejected_before_calling_model(client, monkeypatch):

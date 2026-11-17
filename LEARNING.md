@@ -385,8 +385,12 @@ is the best way to understand them.
   and from what it was built) to every image we publish.
 - **Code scanning.** CodeQL turns the code into a database and follows data
   from untrusted sources (an HTTP request) to dangerous sinks (a SQL query, a
-  shell command, a file path). It also reads our workflow files, where
-  injection bugs are common.
+  shell command, a file path, a log file). It also reads our workflow files,
+  where injection bugs are common. Its first run on this lesson's pull
+  request found a real one: the agent wrote the `X-User-Id` header into its
+  log unchecked, so whoever could reach the agent could write fake log lines.
+  The agent now parses the header into a number first (`main.py`), and logs
+  only that number.
 - **Semantic versioning and the changelog.** `MAJOR.MINOR.PATCH`: patch for
   fixes, minor for features, major for breaking changes. `CHANGELOG.md` is
   written for people, in the same pull request as the change, under
