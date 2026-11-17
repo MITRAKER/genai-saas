@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import fakeredis
 import httpx
@@ -28,7 +28,7 @@ def client(monkeypatch):
 
 
 def token(sub="42", plan="free", minutes=5):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return jwt.encode({"sub": sub, "plan": plan, "exp": now + timedelta(minutes=minutes)},
                       settings.jwt_secret, algorithm="HS256")
 

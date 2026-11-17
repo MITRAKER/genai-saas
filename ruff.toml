@@ -1,3 +1,4 @@
+target-version = "py312"  # matches the Docker images and CI
 line-length = 100
 
 [lint]
