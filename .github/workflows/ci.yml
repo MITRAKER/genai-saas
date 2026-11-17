@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        service: [core, gateway]
+        service: [core, gateway, agent]
     defaults:
       run:
         working-directory: services/${{ matrix.service }}
@@ -28,7 +28,7 @@ jobs:
         run: pytest -q
 
   integration:
-    # Boots the real stack (Postgres, Redis, both services) and tests it
+    # Boots the real stack (Postgres, Redis, all services) and tests it
     # end to end through the gateway, exactly like a user would.
     needs: test
     runs-on: ubuntu-latest

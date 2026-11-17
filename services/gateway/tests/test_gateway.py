@@ -11,9 +11,10 @@ from app import main
 from app.config import settings
 
 
-def fake_core(request: httpx.Request) -> httpx.Response:
-    """Stands in for the core API and echoes what the gateway sent it."""
-    body = json.dumps({"path": request.url.path, "user": request.headers.get("x-user-id")})
+def fake_upstream(request: httpx.Request) -> httpx.Response:
+    """Stands in for the services behind the gateway and echoes what it received."""
+    body = json.dumps({"host": request.url.host, "path": request.url.path,
+                       "user": request.headers.get("x-user-id")})
     # A real network response is a stream, so build one the gateway can stream.
     return httpx.Response(200, headers={"content-type": "application/json"},
                           stream=httpx.ByteStream(body.encode()))
@@ -22,7 +23,7 @@ def fake_core(request: httpx.Request) -> httpx.Response:
 @pytest.fixture()
 def client(monkeypatch):
     with TestClient(main.app) as c:
-        main.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(fake_core))
+        main.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(fake_upstream))
         main.app.state.redis = fakeredis.FakeAsyncRedis()
         yield c
 
@@ -50,7 +51,7 @@ def test_protected_route_requires_token(client):
 def test_valid_token_forwards_user_id(client):
     r = client.get("/api/users/me", headers=auth(token()))
     assert r.status_code == 200
-    assert r.json() == {"path": "/users/me", "user": "42"}
+    assert r.json() == {"host": "localhost", "path": "/users/me", "user": "42"}
 
 
 def test_client_cannot_spoof_user_id(client):
@@ -77,3 +78,13 @@ def test_rate_limit_per_plan(client, monkeypatch):
 
 def test_unknown_route_404(client):
     assert client.get("/api/nope").status_code == 404
+
+
+def test_reviews_route_to_agent_service(client, monkeypatch):
+    monkeypatch.setitem(main.ROUTES, "/api/reviews", ("http://agent:8002", True))
+    r = client.post("/api/reviews/stream", json={"diff": "x"}, headers=auth(token()))
+    assert r.json() == {"host": "agent", "path": "/reviews/stream", "user": "42"}
+
+
+def test_reviews_require_token(client):
+    assert client.post("/api/reviews/stream", json={"diff": "x"}).status_code == 401

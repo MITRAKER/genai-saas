@@ -23,7 +23,12 @@ HOP_HEADERS = {"connection", "keep-alive", "transfer-encoding", "upgrade", "host
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0))
+    # read= is the longest silence allowed between two chunks of a response.
+    # AI reviews stream for minutes; the agent sends a keepalive every 15s,
+    # so 120s only trips when an upstream has really stalled.
+    app.state.http = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=5.0, read=120.0, write=30.0, pool=5.0)
+    )
     app.state.redis = Redis.from_url(settings.redis_url)
     yield
     await app.state.http.aclose()
@@ -69,8 +74,8 @@ async def proxy(request: Request, rest: str):
     except httpx.RequestError:
         raise HTTPException(502, "Upstream service unavailable") from None
 
-    # Stream the body through chunk by chunk, so AI responses (milestone 2)
-    # reach the browser token by token instead of all at the end.
+    # Stream the body through chunk by chunk, so AI reviews reach the
+    # browser token by token instead of all at the end.
     resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_HEADERS}
     return StreamingResponse(
         upstream.aiter_raw(),
