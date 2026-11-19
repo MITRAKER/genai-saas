@@ -1,0 +1,112 @@
+# Continuous delivery. Pushing a version tag releases that version:
+#
+#   git tag -a v0.3.0 -m "v0.3.0" && git push origin v0.3.0
+#
+# 1. the full CI runs again on the tagged commit,
+# 2. each service's Docker image is built and pushed to GitHub Container
+#    Registry (ghcr.io), with an SBOM and build provenance attached,
+# 3. a GitHub release is created with that version's notes from CHANGELOG.md.
+# A tag whose version has no CHANGELOG.md section fails before anything ships.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # never stop a release halfway
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  changelog:
+    name: Release notes exist
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Find this version in CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: scripts/release_notes.sh "$TAG"
+
+  ci:
+    name: CI
+    # GitHub resolves a reusable workflow from the tagged commit itself. The newer
+    # "$/" form that zizmor suggests is not supported by actionlint yet.
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+
+  images:
+    name: Publish ${{ matrix.service }} image
+    needs: [changelog, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+    strategy:
+      matrix:
+        service: [core, gateway, agent]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Image name (registries need lowercase names)
+        id: image
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SERVICE: ${{ matrix.service }}
+        run: echo "name=ghcr.io/${REPOSITORY,,}/${SERVICE}" >> "$GITHUB_OUTPUT"
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.image.outputs.name }}
+          # v1.2.3 is tagged 1.2.3, 1.2 and latest; plus the commit as sha-abc1234.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: services/${{ matrix.service }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true # list of everything inside the image
+          provenance: mode=max # signed record of how and from what it was built
+
+  github-release:
+    name: GitHub release
+    needs: images
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # create the release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Create the release with its CHANGELOG.md notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          scripts/release_notes.sh "$TAG" > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"

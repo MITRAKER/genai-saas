@@ -1,5 +1,5 @@
 # Local development stack. Only the gateway publishes a port to your
-# machine; core, Postgres and Redis are reachable only inside this network.
+# machine; core, agent, Postgres and Redis are reachable only inside this network.
 services:
   gateway:
     build: ./services/gateway
@@ -7,9 +7,11 @@ services:
     env_file: .env
     environment:
       CORE_URL: http://core:8001
+      AGENT_URL: http://agent:8002
       REDIS_URL: redis://redis:6379/0
     depends_on:
       core: { condition: service_healthy }
+      agent: { condition: service_healthy }
       redis: { condition: service_healthy }
     # "docker compose up --wait" waits for this, so tests never race startup.
     healthcheck:
@@ -26,6 +28,15 @@ services:
       postgres: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 5s
+      retries: 10
+
+  agent:
+    build: ./services/agent
+    # LLM_PROVIDER and ANTHROPIC_API_KEY come from .env
+    env_file: .env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
       interval: 5s
       retries: 10
 
