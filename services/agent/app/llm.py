@@ -7,7 +7,7 @@ endpoint code.
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -21,6 +21,7 @@ from anthropic.types.beta import (
 
 from .config import Effort
 from .prompts import SYSTEM_PROMPT, build_user_message
+from .schemas import ContextSnippet
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,9 @@ class ReviewEvent:
 
 
 class ReviewProvider(Protocol):
-    def stream_review(self, diff: str, notes: str | None) -> AsyncIterator[ReviewEvent]: ...
+    def stream_review(
+        self, diff: str, notes: str | None, context: Sequence[ContextSnippet] = ()
+    ) -> AsyncIterator[ReviewEvent]: ...
 
 
 def error_event(code: str, message: str) -> ReviewEvent:
@@ -107,13 +110,15 @@ class AnthropicProvider:
         self.effort: Effort = effort
         self.max_tokens = max_tokens
 
-    async def stream_review(self, diff: str, notes: str | None) -> AsyncIterator[ReviewEvent]:
+    async def stream_review(
+        self, diff: str, notes: str | None, context: Sequence[ContextSnippet] = ()
+    ) -> AsyncIterator[ReviewEvent]:
         try:
             async with self.client.beta.messages.stream(
                 model=self.model,
                 max_tokens=self.max_tokens,
                 system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": build_user_message(diff, notes)}],
+                messages=[{"role": "user", "content": build_user_message(diff, notes, context)}],
                 # Adaptive thinking: Claude decides how much to reason before
                 # answering. "summarized" streams a readable summary of that
                 # reasoning, so the user sees progress instead of a long pause.
@@ -144,7 +149,9 @@ class FakeProvider:
             raise ValueError("delay must not be negative")
         self.delay = delay
 
-    async def stream_review(self, diff: str, notes: str | None) -> AsyncIterator[ReviewEvent]:
+    async def stream_review(
+        self, diff: str, notes: str | None, context: Sequence[ContextSnippet] = ()
+    ) -> AsyncIterator[ReviewEvent]:
         lines = diff.splitlines()
         files = [line for line in lines if line.startswith("+++ b/")]
         added = sum(1 for line in lines if line.startswith("+") and not line.startswith("+++"))
@@ -153,10 +160,12 @@ class FakeProvider:
         await asyncio.sleep(self.delay)
 
         focus = f" Author notes: {notes}" if notes else ""
+        related = f" It read {len(context)} related code snippet(s) as context." if context else ""
         review = (
             "## Summary\n"
             f"This is a fake review (LLM_PROVIDER=fake). The change touches "
-            f"{len(files) or 'an unknown number of'} file(s) and adds {added} line(s).{focus}\n\n"
+            f"{len(files) or 'an unknown number of'} file(s) and adds {added} line(s)."
+            f"{related}{focus}\n\n"
             "## Issues\n"
             "No issues found by the fake reviewer.\n\n"
             "## Suggestions\n"
