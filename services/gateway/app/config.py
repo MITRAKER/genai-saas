@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     core_url: str = "http://localhost:8001"
     agent_url: str = "http://localhost:8002"
+    github_url: str = "http://localhost:8003"
     # Requests allowed per user per minute, by plan.
     rate_limit_free: int = Field(default=30, gt=0, le=100_000)
     rate_limit_pro: int = Field(default=300, gt=0, le=100_000)
@@ -35,5 +36,8 @@ ROUTES: Final = MappingProxyType(
         "/api/auth": (settings.core_url, False),
         "/api/users": (settings.core_url, True),
         "/api/reviews": (settings.agent_url, True),
+        # GitHub has no user token: it signs each delivery instead, and the
+        # GitHub service checks that signature before it reads anything.
+        "/api/github/webhooks": (settings.github_url, False),
     }
 )
