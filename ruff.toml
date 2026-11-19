@@ -1,0 +1,10 @@
+target-version = "py312"  # matches the Docker images and CI
+line-length = 100
+
+[lint]
+select = ["E", "F", "I", "B", "UP"]
+# FastAPI's dependency injection uses Depends()/Header() as defaults by design.
+ignore = ["B008"]
+
+[lint.isort]
+known-first-party = ["app"]
