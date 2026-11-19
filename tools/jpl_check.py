@@ -33,6 +33,7 @@ DEFAULT_PATHS = (
     "services/core/app",
     "services/gateway/app",
     "services/agent/app",
+    "services/github/app",
     "scripts",
     "tools",
 )
@@ -124,11 +125,24 @@ def check_scope(node: ast.AST, path: Path) -> list[Violation]:
     return []
 
 
+def runs_dynamic_code(node: ast.Call) -> bool:
+    """eval(...), importlib.import_module(...) and the like. A method that is
+    merely called `compile`, like re.compile, builds a regex, not code: only
+    the built-in compile(...) (or builtins.compile) counts."""
+    name = call_name(node)
+    if name not in DYNAMIC_CODE:
+        return False
+    if name != "compile" or isinstance(node.func, ast.Name):
+        return True
+    owner = node.func.value if isinstance(node.func, ast.Attribute) else None
+    return isinstance(owner, ast.Name) and owner.id == "builtins"
+
+
 def check_call(node: ast.AST, path: Path) -> list[Violation]:
     if not isinstance(node, ast.Call):
         return []
     name = call_name(node)
-    if name in DYNAMIC_CODE:
+    if runs_dynamic_code(node):
         return [Violation(path, node.lineno, "JPL8", f"`{name}` runs code built at run time")]
     computed = len(node.args) > 1 and not isinstance(node.args[1], ast.Constant)
     if isinstance(node.func, ast.Name) and name in DYNAMIC_ATTRIBUTES and computed:
