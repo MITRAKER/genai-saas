@@ -5,13 +5,13 @@ change follows the same loop.
 
 ## Set up
 
-You need Python 3.12, Docker and `make`.
+You need Python 3.12, Docker, `make` and `openssl`.
 
 ```bash
 python3.12 -m venv .venv && . .venv/bin/activate
 make install          # tools, every service's dependencies, and the git hooks
-sed "s/^JWT_SECRET=.*/JWT_SECRET=$(openssl rand -hex 32)/" .env.example > .env
-make up smoke         # start the stack and run the end-to-end test
+make test-db          # Postgres with pgvector, for the github service's tests
+make up smoke         # write .env, start the stack, run the end-to-end test
 ```
 
 `make` on its own lists every command.
@@ -62,7 +62,8 @@ so a reviewer can agree or push back.
 ```
 services/<name>/app     the service code (FastAPI)
 services/<name>/tests   its tests (pytest)
-scripts/                command-line helpers (smoke test, review client)
+scripts/                command-line helpers: the review client, the end-to-end
+                        tests, and the fake GitHub they run against
 tools/                  repository tools (the NASA/JPL checker)
 docs/adr/               architecture decision records: why things are the way they are
 ```
