@@ -10,6 +10,7 @@ updates:
       - /services/core
       - /services/gateway
       - /services/agent
+      - /services/github
     schedule:
       interval: weekly
       day: monday
@@ -26,6 +27,7 @@ updates:
       - /services/core
       - /services/gateway
       - /services/agent
+      - /services/github
     schedule:
       interval: weekly
       day: monday
@@ -39,6 +41,29 @@ updates:
       # own pull request. Dependabot keeps the 3.12 patch releases coming.
       - dependency-name: python
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
+    commit-message:
+      prefix: deps
+
+  # The images in docker-compose.yml: Postgres with pgvector, and Redis.
+  # (The Makefile's test database reads its image from that file.)
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      compose:
+        patterns: ["*"]
+    ignore:
+      # A new major version of a database needs a migration plan, so a person
+      # starts it; Dependabot keeps the patch and minor releases coming.
+      # (Postgres itself stays on 16: Dependabot keeps the tag's -pg16 ending.)
+      - dependency-name: pgvector/pgvector
+        update-types: ["version-update:semver-major"]
+      - dependency-name: redis
+        update-types: ["version-update:semver-major"]
     commit-message:
       prefix: deps
 
