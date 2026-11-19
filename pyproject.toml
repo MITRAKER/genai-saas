@@ -55,7 +55,7 @@ max-returns = 4
 "tools/**" = ["T201"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["app", "jpl_check", "review"]
+known-first-party = ["app", "fake_github", "jpl_check", "review", "tests"]
 
 [tool.ruff.format]
 quote-style = "double"
