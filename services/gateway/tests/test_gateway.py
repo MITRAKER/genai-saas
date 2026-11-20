@@ -142,6 +142,45 @@ def test_reviews_route_to_agent_service(client, monkeypatch):
     assert r.json()["path"] == "/reviews/stream"
 
 
+def echo_headers(request: httpx2.Request) -> httpx2.Response:
+    """An upstream that answers with the headers and body it received."""
+    names = ("x-hub-signature-256", "x-github-event", "x-user-id", "x-installation-id")
+    body = {
+        "host": request.url.host,
+        "path": request.url.path,
+        "headers": {name: request.headers.get(name) for name in names},
+        "body": request.content.decode(),
+    }
+    return httpx2.Response(
+        200,
+        headers={"content-type": "application/json"},
+        stream=httpx2.ByteStream(json.dumps(body).encode()),
+    )
+
+
+def test_github_webhooks_are_public_and_arrive_unchanged(client, monkeypatch):
+    routes = {**main.ROUTES, "/api/github/webhooks": ("http://github:8003", False)}
+    monkeypatch.setattr(main, "ROUTES", MappingProxyType(routes))
+    main.app.state.http = httpx2.AsyncClient(transport=httpx2.MockTransport(echo_headers))
+    signed = {"X-Hub-Signature-256": "sha256=abc", "X-GitHub-Event": "pull_request"}
+    r = client.post("/api/github/webhooks", content=b'{"action":"opened"}', headers=signed)
+    assert r.status_code == 200
+    echoed = r.json()
+    assert (echoed["host"], echoed["path"]) == ("github", "/github/webhooks")
+    # The GitHub service checks the signature over these exact bytes.
+    assert echoed["body"] == '{"action":"opened"}'
+    assert echoed["headers"]["x-hub-signature-256"] == "sha256=abc"
+    assert echoed["headers"]["x-github-event"] == "pull_request"
+
+
+def test_clients_cannot_claim_to_be_a_github_installation(client):
+    main.app.state.http = httpx2.AsyncClient(transport=httpx2.MockTransport(echo_headers))
+    headers = {**auth(token()), "X-Installation-Id": "2002"}
+    r = client.post("/api/reviews/stream", json={"diff": "x"}, headers=headers)
+    assert r.json()["headers"]["x-installation-id"] is None
+    assert r.json()["headers"]["x-user-id"] == "42"
+
+
 def test_reviews_require_token(client):
     assert client.post("/api/reviews/stream", json={"diff": "x"}).status_code == 401
 

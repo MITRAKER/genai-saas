@@ -18,6 +18,8 @@ from pydantic import ValidationError
 from app import main
 from app.config import Settings
 from app.llm import AnthropicProvider, FakeProvider
+from app.prompts import build_user_message
+from app.schemas import ContextSnippet
 
 DIFF = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"
 
@@ -291,3 +293,79 @@ def test_real_sdk_request_and_stream_parsing():
     assert body["output_config"] == {"effort": "high"}
     assert body["fallbacks"] == "default"
     assert "server-side-fallback-2026-07-01" in sent["headers"]["anthropic-beta"]
+
+
+# --- Reviews for the GitHub integration --------------------------------------
+# Its worker sends X-Installation-Id instead of X-User-Id, and related code
+# from the repository as context.
+
+CONTEXT = [
+    {"path": "shop/cart.py", "start_line": 1, "end_line": 6, "content": "def cart_total(): ..."},
+    {"path": "shop/orders.py", "start_line": 9, "end_line": 9, "content": "total = cart_total()"},
+]
+INSTALLATION = {"X-Installation-Id": "2002"}
+
+
+def test_the_github_worker_reviews_with_related_code(client, caplog):
+    body = {"diff": DIFF, "context": CONTEXT}
+    with caplog.at_level(logging.INFO, logger="agent"):
+        r = client.post("/reviews/stream", json=body, headers=INSTALLATION)
+    assert r.status_code == 200
+    review = "".join(data["text"] for name, data in parse_sse(r.text) if name == "text")
+    assert "It read 2 related code snippet(s) as context." in review
+    assert "review done installation=2002 usage=" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X-User-Id": "1", "X-Installation-Id": "2"},  # both: who would pay?
+        {"X-Installation-Id": "0"},
+        {"X-Installation-Id": "2002; DROP TABLE"},
+    ],
+)
+def test_exactly_one_valid_identity(client, headers):
+    assert client.post("/reviews/stream", json={"diff": DIFF}, headers=headers).status_code == 422
+
+
+def test_oversized_context_rejected_before_calling_model(client, monkeypatch):
+    monkeypatch.setattr(main.settings, "max_context_chars", 10)
+    body = {"diff": DIFF, "context": CONTEXT}
+    r = client.post("/reviews/stream", json=body, headers=INSTALLATION)
+    assert r.status_code == 413
+    assert r.json()["detail"].startswith("Context is too large")
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        [CONTEXT[0]] * 21,  # more snippets than allowed
+        [{**CONTEXT[0], "start_line": 7, "end_line": 6}],
+        [{**CONTEXT[0], "start_line": 0}],
+        [{**CONTEXT[0], "content": ""}],
+        [{**CONTEXT[0], "path": ""}],
+    ],
+)
+def test_bad_context_rejected(client, context):
+    body = {"diff": DIFF, "context": context}
+    assert client.post("/reviews/stream", json=body, headers=INSTALLATION).status_code == 422
+
+
+def test_context_comes_first_in_its_own_tags():
+    snippet = ContextSnippet(path='odd"name.py', start_line=3, end_line=4, content="x = 1")
+    message = build_user_message(DIFF, "notes", [snippet])
+    assert message.index("<context>") < message.index("<author_notes>") < message.index("<diff>")
+    # The quote is escaped, so a file name can't break out of its attribute.
+    assert '<file path="odd&quot;name.py" lines="3-4">\nx = 1\n</file>' in message
+    assert "<context>" not in build_user_message(DIFF)
+
+
+def test_anthropic_provider_sends_the_context():
+    provider, calls = make_provider(FakeSDKStream([], final_message()))
+    snippet = ContextSnippet(path="shop/cart.py", start_line=1, end_line=2, content="def f(): ...")
+
+    async def go():
+        return [e async for e in provider.stream_review(DIFF, None, [snippet])]
+
+    asyncio.run(go())
+    assert '<file path="shop/cart.py" lines="1-2">' in calls[0]["messages"][0]["content"]
