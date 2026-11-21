@@ -12,6 +12,28 @@ those notes under a new version heading (see CONTRIBUTING.md, "Releasing").
 
 ### Added
 
+- GitHub integration (`services/github`): a GitHub App reviews pull requests
+  and posts each review as a comment. Webhooks are accepted only with a valid
+  signature and only for the accounts in `GITHUB_ALLOWED_ACCOUNTS`, and are
+  queued in Postgres. A worker fetches the diff, finds related code, asks the
+  agent for a review and posts it: one review per commit, at most
+  `MAX_REVIEWS_PER_DAY` per installation, retried with backoff when GitHub
+  or the agent fails. Uninstalling the app deletes the code it indexed.
+- Code embeddings in pgvector: the worker indexes each repository's code and
+  gives the reviewer the code most related to the change, such as the
+  callers of a changed function. Embeddings come from a local model (feature
+  hashing, no API key) or from Voyage AI's `voyage-code-3`. Only files whose
+  content changed are fetched and embedded again.
+- The agent takes related code as context (`context` in
+  `POST /reviews/stream`) and reviews for a GitHub App installation
+  (`X-Installation-Id`) as well as for a user.
+- `make demo`: the whole GitHub flow against a fake GitHub
+  (`scripts/fake_github.py`), with no GitHub account. CI runs it too
+  (`scripts/github_e2e.sh`).
+- `make env` writes `.env` with fresh secrets, and `make test-db` starts the
+  database the github service's tests need.
+- Lessons 4 and 5 in LEARNING.md, and ADRs 0004 (Postgres as the job queue)
+  and 0005 (pgvector for code embeddings).
 - CI/CD quality gates on every pull request: pre-commit (ruff lint and
   format, shellcheck, hadolint, actionlint, zizmor), mypy `--strict`, tests
   with a 90% line and branch coverage gate, pip-audit, a gitleaks scan of the
@@ -38,6 +60,10 @@ those notes under a new version heading (see CONTRIBUTING.md, "Releasing").
 - `scripts/review.py` reports errors in one line instead of a traceback.
 - Upgraded every dependency to its current release; the gateway, the agent
   and the tests now use `httpx2`.
+- Docker Compose pins the Postgres (pgvector 0.8.7) and Redis (7.4.12)
+  images, and Dependabot keeps them current.
+- `tools/jpl_check.py` no longer reports `re.compile()` as dynamic code; it
+  still reports the built-in `compile()`.
 
 ### Fixed
 
@@ -66,6 +92,11 @@ those notes under a new version heading (see CONTRIBUTING.md, "Releasing").
   vulnerabilities that pip-audit found.
 - The services refuse to start without a `JWT_SECRET` of at least 32
   characters; there is no built-in default secret anymore.
+- Each container gets only the settings it uses instead of the whole `.env`:
+  the gateway no longer sees the Anthropic API key, and the agent no longer
+  sees the JWT secret.
+- Clients can't pose as a GitHub installation: the gateway strips
+  `X-Installation-Id` from incoming requests, like the other identity headers.
 
 ## [0.2.0] - 2026-11-17
 

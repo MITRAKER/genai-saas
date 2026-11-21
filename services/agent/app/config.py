@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     review_max_tokens: int = Field(default=32_000, gt=0, le=128_000)
     # ~4 characters per token, so this caps one review at roughly 50k input tokens.
     max_diff_chars: int = Field(default=200_000, gt=0, le=1_000_000)
+    # Related code the GitHub integration sends along: about 15k tokens at most.
+    max_context_chars: int = Field(default=60_000, gt=0, le=500_000)
     # Hard deadline for one review, so no stream can run (and bill) forever.
     review_timeout_seconds: float = Field(default=600, gt=0, le=3600)
     # Send an SSE comment this often so proxies don't drop a quiet connection.

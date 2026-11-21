@@ -1,7 +1,9 @@
 """AI agent service: turns a diff into a streamed code review.
 
-Like the core API it has no public port; the gateway authenticates the
-user, applies rate limits and forwards the request with X-User-Id.
+Like the core API it has no public port. Two services call it: the gateway,
+which authenticates a person and forwards their id in X-User-Id, and the
+GitHub integration's worker, which reviews pull requests for a GitHub App
+installation and sends its id in X-Installation-Id.
 """
 
 import logging
@@ -12,18 +14,19 @@ from typing import Annotated, Final
 import anthropic
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
 
 from .config import settings
 from .llm import AnthropicProvider, FakeProvider, ReviewProvider
+from .schemas import ReviewRequest
 from .sse import format_sse, with_keepalive
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("agent")
 
-# The gateway forwards the id from the user's verified token: always a positive
-# whole number. A request with anything else did not come through the gateway.
-USER_ID_PATTERN: Final = r"^[1-9][0-9]{0,18}$"
+# Both ids are positive whole numbers: the user's, from their verified token,
+# and the installation's, from GitHub. A request with anything else did not
+# come from the gateway or the worker.
+ID_PATTERN: Final = r"^[1-9][0-9]{0,18}$"
 
 
 @asynccontextmanager
@@ -46,41 +49,61 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="AI Agent Service", lifespan=lifespan)
 
 
-class ReviewRequest(BaseModel):
-    diff: str = Field(min_length=1, description="A unified diff, e.g. the output of `git diff`")
-    notes: str | None = Field(
-        default=None, max_length=2000, description="Optional notes from the author"
-    )
-
-
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def who_pays(user_id: str | None, installation_id: str | None) -> str:
+    """ "user=42" or "installation=7": who a review is for, and later billed to.
+
+    Exactly one of the two: a request with both or neither did not come from
+    the gateway or the worker. Only these numbers are ever logged, so no
+    request can write text of its choosing into our logs.
+    """
+    if user_id is not None and installation_id is None:
+        return f"user={int(user_id)}"
+    if installation_id is not None and user_id is None:
+        return f"installation={int(installation_id)}"
+    raise HTTPException(
+        status.HTTP_422_UNPROCESSABLE_CONTENT, "Send exactly one of X-User-Id and X-Installation-Id"
+    )
+
+
+def check_size(body: ReviewRequest) -> None:
+    """Check limits *before* calling the model: an oversized request would
+    cost money and probably exceed the context window anyway."""
+    if len(body.diff) > settings.max_diff_chars:
+        raise HTTPException(
+            status.HTTP_413_CONTENT_TOO_LARGE,
+            f"Diff is too large ({len(body.diff)} characters, limit {settings.max_diff_chars})",
+        )
+    context_chars = sum(len(snippet.content) for snippet in body.context)
+    if context_chars > settings.max_context_chars:
+        raise HTTPException(
+            status.HTTP_413_CONTENT_TOO_LARGE,
+            f"Context is too large ({context_chars} characters, "
+            f"limit {settings.max_context_chars})",
+        )
 
 
 @app.post("/reviews/stream")
 async def stream_review(
     body: ReviewRequest,
     request: Request,
-    x_user_id: Annotated[str, Header(pattern=USER_ID_PATTERN)],
+    x_user_id: Annotated[str | None, Header(pattern=ID_PATTERN)] = None,
+    x_installation_id: Annotated[str | None, Header(pattern=ID_PATTERN)] = None,
 ) -> StreamingResponse:
-    # Parse the header once, at the boundary (JPL rule 5). Only this number is
-    # ever logged, so no request can write text of its choosing into our logs.
-    user_id = int(x_user_id)
-    # Check limits *before* calling the model: an oversized diff would cost
-    # money and probably exceed the context window anyway.
-    if len(body.diff) > settings.max_diff_chars:
-        raise HTTPException(
-            status.HTTP_413_CONTENT_TOO_LARGE,
-            f"Diff is too large ({len(body.diff)} characters, limit {settings.max_diff_chars})",
-        )
+    # Parse the headers once, at the boundary (JPL rule 5).
+    payer = who_pays(x_user_id, x_installation_id)
+    check_size(body)
     provider: ReviewProvider = request.app.state.provider
 
     async def events() -> AsyncIterator[str]:
-        async for event in provider.stream_review(body.diff, body.notes):
+        async for event in provider.stream_review(body.diff, body.notes, body.context):
             if event.type == "done":
                 # Milestone 4 turns this log line into usage-based billing.
-                logger.info("review done user=%d usage=%s", user_id, event.data["usage"])
+                logger.info("review done %s usage=%s", payer, event.data["usage"])
             yield format_sse(event.type, event.data)
 
     return StreamingResponse(

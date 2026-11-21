@@ -1,17 +1,27 @@
-# Local development stack. Only the gateway publishes a port to your
-# machine; core, agent, Postgres and Redis are reachable only inside this network.
+# Local development stack. Only the gateway publishes a port to your machine;
+# the other services, Postgres and Redis are reachable only inside this network.
+#
+# Least privilege: no service reads the whole .env. Each gets only the settings
+# it uses, so the gateway never sees the Anthropic key and the agent never sees
+# JWT_SECRET. ${NAME:-default} takes NAME from .env (`make env` writes it), or
+# the default when .env has no NAME. A new setting must be listed here too.
 services:
   gateway:
     build: ./services/gateway
     ports: ["8000:8000"]
-    env_file: .env
     environment:
+      JWT_SECRET: ${JWT_SECRET:-}
+      RATE_LIMIT_FREE: ${RATE_LIMIT_FREE:-30}
+      RATE_LIMIT_PRO: ${RATE_LIMIT_PRO:-300}
+      MAX_BODY_BYTES: ${MAX_BODY_BYTES:-1048576}
       CORE_URL: http://core:8001
       AGENT_URL: http://agent:8002
+      GITHUB_URL: http://github:8003
       REDIS_URL: redis://redis:6379/0
     depends_on:
       core: { condition: service_healthy }
       agent: { condition: service_healthy }
+      github: { condition: service_healthy }
       redis: { condition: service_healthy }
     # "docker compose up --wait" waits for this, so tests never race startup.
     healthcheck:
@@ -21,8 +31,9 @@ services:
 
   core:
     build: ./services/core
-    env_file: .env
     environment:
+      JWT_SECRET: ${JWT_SECRET:-}
+      JWT_TTL_MINUTES: ${JWT_TTL_MINUTES:-60}
       DATABASE_URL: postgresql+psycopg2://app:app@postgres:5432/app
     depends_on:
       postgres: { condition: service_healthy }
@@ -33,16 +44,60 @@ services:
 
   agent:
     build: ./services/agent
-    # LLM_PROVIDER and ANTHROPIC_API_KEY come from .env
-    env_file: .env
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-fake}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5-5}
+      REVIEW_EFFORT: ${REVIEW_EFFORT:-high}
+      REVIEW_TIMEOUT_SECONDS: ${REVIEW_TIMEOUT_SECONDS:-600}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
       interval: 5s
       retries: 10
 
+  # The GitHub integration is one image run twice: "github" answers GitHub's
+  # webhooks and queues a job, "github-worker" does the reviews.
+  github:
+    build: ./services/github
+    environment:
+      DATABASE_URL: postgresql+psycopg://app:app@postgres:5432/app
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      GITHUB_ALLOWED_ACCOUNTS: ${GITHUB_ALLOWED_ACCOUNTS:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
+      interval: 5s
+      retries: 10
+
+  github-worker:
+    build: ./services/github
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://app:app@postgres:5432/app
+      AGENT_URL: http://agent:8002
+      GITHUB_API_URL: ${GITHUB_API_URL:-https://api.github.com}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_PRIVATE_KEY_PATH: ${GITHUB_PRIVATE_KEY_PATH:-/run/secrets/github-app.pem}
+      MAX_REVIEWS_PER_DAY: ${MAX_REVIEWS_PER_DAY:-50}
+      EMBEDDINGS_PROVIDER: ${EMBEDDINGS_PROVIDER:-local}
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
+    # The GitHub App's private key lives in ./secrets (never committed).
+    volumes: ["./secrets:/run/secrets:ro"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      agent: { condition: service_healthy }
+    # "docker compose stop" sends SIGTERM: the worker finishes the review in
+    # progress, then exits. One still running after 60 s is killed, and its job
+    # is picked up again later (app/jobs.py), so nothing is lost.
+    stop_grace_period: 60s
+    # The worker exits after WORKER_MAX_POLLS polls (JPL rule 2: every loop has
+    # a bound), and Docker starts a fresh one. It also restarts after a crash.
+    restart: unless-stopped
+
   postgres:
-    # pgvector image = Postgres + the vector extension we need in milestone 3.
-    image: pgvector/pgvector:pg16
+    # Postgres with the pgvector extension, which stores the code embeddings.
+    image: pgvector/pgvector:0.8.7-pg16
     environment:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: app
@@ -54,7 +109,7 @@ services:
       retries: 10
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.12-alpine
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

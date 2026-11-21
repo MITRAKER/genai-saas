@@ -24,8 +24,9 @@ from .ratelimit import check_rate_limit
 HOP_HEADERS: Final = frozenset(
     {"connection", "keep-alive", "transfer-encoding", "upgrade", "host", "content-length"}
 )
-# Identity headers only the gateway may set. Clients' copies are dropped.
-IDENTITY_HEADERS: Final = frozenset({"x-user-id", "x-user-plan"})
+# Identity headers only the gateway (or, for X-Installation-Id, the GitHub
+# worker inside our network) may set. Clients' copies are dropped.
+IDENTITY_HEADERS: Final = frozenset({"x-user-id", "x-user-plan", "x-installation-id"})
 # Path segments that mean "this folder" and "the folder above".
 DOT_SEGMENTS: Final = frozenset({".", ".."})
 

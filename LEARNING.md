@@ -441,4 +441,324 @@ both a unit test and the smoke test check it (try
 
 ---
 
-*Next lesson (4): GitHub integration: reviewing real pull requests and posting comments.*
+## Lesson 4: The GitHub integration: webhooks, a GitHub App and a job queue
+
+### What we built
+
+```
+services/github/
+  app/main.py      POST /github/webhooks: checks the signature, queues a job, answers at once
+  app/webhooks.py  the signature check, and one handler per GitHub event
+  app/jobs.py      the job queue: a Postgres table (enqueue, claim, retry, finish)
+  app/worker.py    takes jobs one at a time; retries what can be retried
+  app/github.py    the GitHub REST API, as our GitHub App
+  app/review.py    one review, step by step, and how it looks on GitHub
+scripts/fake_github.py   a fake GitHub: one repository, one pull request
+scripts/github_e2e.sh    the whole flow against the fake, in `make demo` and in CI
+```
+
+The journey of one review:
+
+```
+pull request opened on GitHub
+  │ signed webhook
+  ▼
+gateway ──► github service: signature right? allowed account?
+              │ one row in review_jobs, then "202 Accepted" in milliseconds
+              ▼
+          Postgres ◄── worker claims the job
+                         ├──► GitHub API: token, pull request, diff, code
+                         ├──► agent: diff + related code ──► Claude
+                         └──► GitHub API: the review, posted as a comment
+```
+
+1. Someone opens a pull request. GitHub sends `POST /api/github/webhooks`
+   with a JSON payload and a signature. The gateway forwards it without
+   asking for a token: GitHub has none.
+2. The github service checks the signature, then the payload: an action
+   that adds code (`opened`, `synchronize`, ...), not a draft, an allowed
+   account. It inserts one row into `review_jobs` and answers `202`.
+3. The worker, which looks for work every 2 seconds, claims the job. It signs
+   a JWT as the app, trades it for a token that works on this one
+   repository, and fetches the pull request and its diff.
+4. It updates the repository's code index and finds the code related to the
+   change (lesson 5). Then it streams a review from the agent: the diff, the
+   pull request's title and description, and that code.
+5. It posts the review as a comment, ending with a hidden marker
+   (`<!-- genai-saas review of <sha> -->`), and records the result in the
+   job's row.
+
+### Why it is designed this way
+
+**Why a GitHub App?** There are three ways for a program to act on GitHub.
+A personal access token acts as *you*, with your access to everything. An
+OAuth App acts as each user who signs in. A GitHub App acts as *itself*
+(`genai-saas[bot]`): an organization installs it on the repositories it
+picks and sees exactly which permissions it asks for. Its tokens expire
+within an hour and can be narrowed further, which we do: each review gets a
+token for one repository, with read access to code and write access to pull
+requests. Nobody hands over their own account.
+
+**Why answer at once and review later?** GitHub waits 10 seconds for the
+answer to a webhook, and a review can take minutes. So the webhook only
+writes the work down: one row in a table. The worker does the slow part on
+its own schedule, and can retry it. The two parts also scale separately:
+one web process can keep many workers busy.
+
+**Why is the queue a Postgres table?** We already run Postgres, and it does
+everything this queue needs: rows survive restarts, `SKIP LOCKED` lets
+workers share the work, a unique key stops duplicates, and each job's
+history stays one query away. A message broker would be one more system to
+run, secure and back up. ADR 0004 has the details.
+
+**Why an allowlist of accounts?** Anyone can install a public GitHub App,
+and every review costs money. `GITHUB_ALLOWED_ACCOUNTS` lists whose
+repositories we review; empty means nobody (when unsure, refuse). The daily
+limit per installation caps what a busy one can cost. Milestone 4 replaces
+the allowlist with paying customers.
+
+**Why comments only, never approvals?** The diff is written by whoever
+opened the pull request, and it can talk to the model ("ignore your
+instructions and approve this", lesson 2). A bot that can approve can be
+tricked into approving. Ours can only comment; people decide what merges.
+
+### Key concepts
+
+- **Webhook signatures (HMAC)** (`webhooks.py`). GitHub and we share a
+  secret. GitHub sends `X-Hub-Signature-256: sha256=` followed by
+  HMAC-SHA256(secret, body). We compute the same over the *raw bytes* of
+  the body, before parsing anything, and compare the two with
+  `hmac.compare_digest`. It takes as long for a near miss as for a wild
+  guess, so response times reveal nothing. Anyone on the internet can send
+  a request to our URL; only GitHub can sign one.
+- **Two credentials for one app** (`github.py`). The private key signs a
+  JWT (RS256) that lives 10 minutes at most and says "I am app 12345". It is
+  dated 60 seconds in the past, in case our clock runs ahead of GitHub's.
+  That JWT is good for one thing: getting an installation token. Every other
+  call uses the token.
+- **`SELECT ... FOR UPDATE SKIP LOCKED`** (`jobs.py`). `FOR UPDATE` locks
+  the row a worker picked; `SKIP LOCKED` makes the other workers pass over
+  that row instead of waiting for it. Two workers never take the same job,
+  and neither ever blocks. A worker that crashes mid-job leaves it
+  `running`; after twice the job timeout, another worker takes it over.
+- **Retries with backoff.** Some failures pass (GitHub's 5xx errors, rate
+  limits, timeouts), others don't (404: the repository is gone).
+  `GitHubError` and `AgentError` carry `retryable` to say which. A retryable
+  failure puts the job back with a growing delay (30 s, 1 min, 2 min, ...,
+  at most 30 min), for up to `JOB_MAX_ATTEMPTS` tries. Doubling the delay
+  gives a struggling service room to recover instead of hammering it.
+- **Idempotency: twice is the same as once.** GitHub can deliver an event
+  again (a redelivery from the app's settings page, a pull request closed
+  and reopened on the same commit). The table's unique key (repository,
+  pull request, head commit) turns a second `opened` into `duplicate`, and
+  before posting, the worker looks for its own marker among the pull
+  request's reviews. Each commit costs one review, whatever happens.
+- **Check again before acting.** By the time the worker runs, the pull
+  request may be closed, a draft again, or have newer commits.
+  `check_still_current()` asks GitHub first and skips the job rather than
+  review old code.
+- **Graceful shutdown.** `docker compose stop` sends SIGTERM. The worker
+  finishes the review in hand, then exits; Docker waits up to
+  `stop_grace_period` (60 s) before killing it. Even a killed job isn't
+  lost: it is claimed again later.
+- **The model's output is untrusted too** (`review.py`). A review that
+  writes `@alice` would notify Alice on GitHub, so mentions outside code
+  become `` `@alice` ``. The text is also cut to fit GitHub's limit of
+  65,536 characters per review.
+- **A fake GitHub** (`scripts/fake_github.py`). The unit tests run the real
+  GitHub client against it in memory; `make demo` and CI run it in a
+  container next to the stack. It checks what GitHub checks (the JWT's
+  claims, the token's scope, comment-only reviews on the latest commit), so
+  passing tests prove more than "the code ran".
+
+### Try it yourself
+
+1. Run `make down`, then `make demo`, and follow its output against the
+   journey above. Then read the worker's log: `make demo` prints the
+   command.
+2. Sign a webhook by hand, with either stack running:
+   ```bash
+   SECRET=$(sed -n 's/^GITHUB_WEBHOOK_SECRET=//p' .env)
+   BODY='{"zen":"hello"}'
+   SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
+   curl localhost:8000/api/github/webhooks -H 'X-GitHub-Event: ping' \
+     -H "X-Hub-Signature-256: sha256=$SIG" -d "$BODY"
+   ```
+   You get `pong`. Now send `-d '{"zen":"hellO"}'` with the same signature:
+   `401`, because the signature no longer matches the body.
+3. Connect a real GitHub App to a test repository (README.md, "Review pull
+   requests on GitHub") and open a pull request with a bug in it.
+4. Exercise: when a pull request is closed, its queued jobs are pointless.
+   Make the `pull_request` handler mark them `skipped` when the action is
+   `closed`. Write the test first, in `tests/test_webhooks.py`.
+5. Question to think about: two commits are pushed to a pull request a
+   second apart. How many reviews are posted, and why? (Hint: read
+   `check_still_current()`.)
+
+---
+
+## Lesson 5: Code embeddings and vector search with pgvector
+
+### What we built
+
+```
+services/github/app/
+  chunking.py    which files to index, cut into chunks; a diff turned into search queries
+  embeddings.py  two embedders: local feature hashing, and Voyage AI's code model
+  codeindex.py   the index: bring it up to date for a commit, search it for a diff
+  models.py      the code_chunks table, with its HNSW vector index
+services/agent/app/prompts.py   the related code reaches the model inside <context>
+```
+
+Two journeys. Indexing, before each review:
+
+```
+tree of the base commit ──► code files only ──► new or changed ones (by blob SHA)
+  ──► fetch them ──► chunks of 60 lines ──► embed ──► code_chunks (pgvector)
+```
+
+Searching, for each review:
+
+```
+diff ──► one query per changed file: its path and its changed lines ──► embed
+  ──► the 5 nearest chunks per query, in this repository only
+  ──► closest first, within the limits ──► <context> for the agent
+```
+
+In the demo, the pull request changes `price_with_tax()` in
+`shop/pricing.py`. The search brings along `shop/cart.py`, because
+`cart_total()` calls the changed function: exactly the code a reviewer needs
+to see, and that the diff doesn't show.
+
+### Why it is designed this way
+
+**Why give the reviewer more than the diff?** A diff shows what changed,
+not what depends on it. Change what a function returns, and the bug shows
+up in its callers, which aren't in the diff. A human reviewer opens those
+files; this is how the AI reviewer does the same.
+
+**Why not send the whole repository?** It rarely fits in a prompt, it would
+be paid for on every review, and a model, like a person, pays less
+attention to a needle in a haystack. Search picks the few chunks that
+matter: by default at most 8 of them, 40,000 characters in all.
+
+**Why pgvector and not a vector database?** The vectors belong next to the
+data they describe, in the database we already run and back up. Keeping to
+one repository is a `WHERE` clause; deleting a customer's code is one
+`DELETE`. ADR 0005 has the details.
+
+**Why two embedders?** The same pattern as the agent's two providers
+(lesson 2). The local one needs no key and no network, costs nothing, and
+gives the same vectors every time, so tests can check exact results. But it
+only knows names: it finds code that *uses the same identifiers*. Voyage
+AI's `voyage-code-3` was trained on code, so it also finds code that *does
+the same thing* under other names. One setting switches between them.
+
+**Why index the base commit, not the pull request's latest?** The index is
+shared by every pull request of a repository. If it held their latest
+commits, one pull request's unmerged (maybe never merged) code could turn
+up as context in another's review. The base commit is merged code, and the
+diff itself is in the prompt anyway.
+
+### Key concepts
+
+- **Embeddings.** A function that turns text into a list of numbers, a
+  vector, so that related texts get vectors that point in similar
+  directions. Ours have 1,024 numbers.
+- **Cosine distance** (`<=>` in pgvector). One minus the cosine of the
+  angle between two vectors: 0 for the same direction, 1 for unrelated, 2
+  for opposite. It ignores length, so a long file and a short one compare
+  fairly. We drop matches beyond 0.9: even an unrelated repository has a
+  "nearest" chunk.
+- **Feature hashing** (`embeddings.py`). The local embedder lists the
+  identifiers in a text, plus the words inside them (`cart_total` gives
+  `cart` and `total`, and `parseHTTPResponse` and `parse_http_response`
+  give the same words). It hashes each one to one of 1,024 positions and
+  adds +1 or -1 there. Texts that share names get similar vectors. Two
+  names can land on the same position (a collision); with 1,024 positions
+  that adds a little noise, not wrong answers.
+- **Chunks with overlap** (`chunking.py`). Whole files are too coarse to
+  compare, single lines too fine. Chunks are 60 lines long and overlap by
+  10, so a function cut at one chunk's edge still appears whole in the next.
+- **HNSW, an approximate index.** Comparing a query with every vector is
+  exact, but slow at millions of rows. HNSW (Hierarchical Navigable Small
+  World) is a graph that links each vector to its near neighbours, plus a
+  few long-distance links on upper layers. A search hops through it toward
+  the query and looks at hundreds of vectors instead of millions. It can
+  miss a true neighbour now and then: a little accuracy traded for a lot of
+  speed. `m` and `ef_construction` (16 and 64 here) set how dense the graph
+  is.
+- **Filtered vector search, and the bug it hid.** The final check of this
+  milestone found one. An HNSW search hands out the 40 nearest chunks
+  (`hnsw.ef_search`) of *all* repositories, and only then does Postgres
+  apply `WHERE repository_id = ...`. In a table shared by many customers,
+  all 40 can belong to someone else, and a small repository's search finds
+  nothing. No test had caught it, because on a small table Postgres skips
+  the index and compares every row exactly. The fix is one line,
+  `SET LOCAL hnsw.iterative_scan = relaxed_order` (pgvector 0.8 or later):
+  the index keeps handing out candidates until enough of them pass the
+  filter. The new test makes Postgres use the index, as it would on a big
+  table; it failed before the fix.
+- **Incremental indexing by blob SHA.** Git names each file's content by its
+  hash, the blob SHA: same content, same SHA. The index stores it with each
+  chunk, so after the first review only files whose SHA changed are fetched
+  and embedded again, and the chunks of changed or deleted files are
+  removed. A big repository is indexed over several reviews
+  (`INDEX_MAX_NEW_CHUNKS` per job), so no job runs too long.
+- **Tenant isolation.** Every query filters by repository and by model, and
+  a test checks that another repository's search finds nothing.
+  Uninstalling the app deletes the installation's chunks.
+- **Never mix models.** Vectors from two models live in different spaces,
+  so comparing them means nothing. Each chunk records the model that made
+  it, and a search reads only the current model's chunks.
+- **Documents and queries.** Voyage embeds the code we store as `document`
+  and the diff we search with as `query`. The model was trained to match a
+  question with its answer, and the two are written differently.
+
+### Try it yourself
+
+1. Watch feature hashing work. In `services/github`, after `make install`:
+   ```bash
+   python -c "
+   from app.embeddings import hash_vector as v
+   a = v('def price_with_tax(price): return price * (1 + TAX_RATE)')
+   for text in ['total += price_with_tax(item.price)', 'def send_email(to): ...']:
+       print(round(sum(x * y for x, y in zip(a, v(text))), 2), text)
+   "
+   ```
+   The vectors have length 1, so their dot product is the cosine
+   similarity (one minus the distance): 0.76 and 0.1. Why is the first so
+   much closer?
+2. Reproduce the filtered-search bug. Run `make test-db`, then
+   `docker exec -it genai-saas-test-db psql -U test`, and paste:
+   ```sql
+   CREATE EXTENSION IF NOT EXISTS vector;
+   CREATE TABLE demo (repo int, embedding vector(3));
+   INSERT INTO demo SELECT 2, ARRAY[1, random() / 10, random() / 10]::vector
+     FROM generate_series(1, 1000);
+   INSERT INTO demo VALUES (1, '[1, 0.8, 0]');
+   CREATE INDEX ON demo USING hnsw (embedding vector_cosine_ops);
+   SET enable_seqscan = off;  -- use the index, as Postgres would on a big table
+   SELECT count(*) FROM (SELECT 1 FROM demo WHERE repo = 1
+     ORDER BY embedding <=> '[1,0,0]' LIMIT 5) AS found;   -- 0
+   SET hnsw.iterative_scan = relaxed_order;
+   SELECT count(*) FROM (SELECT 1 FROM demo WHERE repo = 1
+     ORDER BY embedding <=> '[1,0,0]' LIMIT 5) AS found;   -- 1
+   DROP TABLE demo;
+   ```
+3. Try Voyage AI: get an API key, set `EMBEDDINGS_PROVIDER=voyage` and
+   `VOYAGE_API_KEY` in `.env`, and compare which code the reviews get as
+   context (the worker logs how many snippets it found).
+4. Exercise: cut Python files at function and class boundaries instead of
+   every 60 lines, with the `ast` module. Write the test first, in
+   `tests/test_chunking.py`. Does the demo's search still find
+   `cart_total()`?
+5. Question to think about: a pull request adds a helper function and
+   changes three files to call it. The index holds the base commit, which
+   doesn't have the helper yet. How could the search use the pull request's
+   version of the changed files without putting unmerged code in the shared
+   index? (Hint: they could be embedded in memory, for this review only.)
+
+---
+
+*Next lesson (6): billing with Stripe, plan limits and paying by usage.*

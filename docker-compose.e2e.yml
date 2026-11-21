@@ -1,0 +1,36 @@
+# The end-to-end demo. `make demo` and CI start the stack with this file on top
+# of docker-compose.yml, so the worker talks to a fake GitHub (scripts/
+# fake_github.py) instead of the real one. No GitHub account, App or internet
+# connection is needed, and nothing is posted anywhere real.
+services:
+  fake-github:
+    # Any Python 3.12 can run the fake, which uses only the standard library.
+    # Reusing the github service's image means no extra image to download or
+    # keep up to date, and it runs as that image's unprivileged user.
+    build: ./services/github
+    command: ["python", "/fake/fake_github.py", "--port", "9000"]
+    volumes: ["./scripts/fake_github.py:/fake/fake_github.py:ro"]
+    # The test script reads the posted reviews from here. 127.0.0.1 keeps the
+    # fake off your network.
+    ports: ["127.0.0.1:9000:9000"]
+    init: true  # so Ctrl-C and "docker compose stop" end it at once
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/_fake/health')"]
+      interval: 2s
+      retries: 15
+
+  github:
+    environment:
+      # The fake pull request is in demo-org/shop.
+      GITHUB_ALLOWED_ACCOUNTS: demo-org
+
+  github-worker:
+    environment:
+      GITHUB_API_URL: http://fake-github:9000
+      GITHUB_APP_ID: "12345"  # the App ID the fake expects
+      # A throwaway key from `make demo-key`. The fake can't check signatures,
+      # but the worker signs its JWT with it exactly as it would for GitHub.
+      GITHUB_PRIVATE_KEY_PATH: /run/secrets/demo-app.pem
+      WORKER_POLL_SECONDS: "0.5"
+    depends_on:
+      fake-github: { condition: service_healthy }

@@ -1,5 +1,7 @@
-# Secrets: copy .env.example to .env and never commit the real file.
+# Secrets: `make env` writes .env, and the GitHub App's private key goes in
+# secrets/. Never commit either.
 .env
+secrets/
 
 # Python
 __pycache__/

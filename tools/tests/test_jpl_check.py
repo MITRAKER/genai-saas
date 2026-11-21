@@ -33,6 +33,9 @@ def test_clean_code_passes():
         ("from itertools import repeat\nfor x in repeat(1):\n    pass\n", "JPL2"),
         ("x = 0\ndef f():\n    global x\n", "JPL6"),
         ("eval('1 + 1')\n", "JPL8"),
+        ("compile(source, 'x.py', 'exec')\n", "JPL8"),
+        ("import builtins\nbuiltins.compile(source, 'x.py', 'exec')\n", "JPL8"),
+        ("df.eval(expression)\n", "JPL8"),
         ("import importlib\nimportlib.import_module(name)\n", "JPL8"),
         ("getattr(obj, name)\n", "JPL9"),
     ],
@@ -52,6 +55,8 @@ def test_allowed_lookalikes():
         "for x in itertools.repeat(1, 3):\n"  # bounded repeat
         "    pass\n"
         "getattr(obj, 'name')\n"  # literal attribute name
+        "import re\n"
+        "WORD = re.compile('[a-z]+')\n"  # a regex, not code
         "class A:\n"
         "    def close(self):\n"
         "        self.client.close()\n"  # same name, different object
